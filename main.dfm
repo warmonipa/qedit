@@ -789,6 +789,20 @@ object Form1: TForm1
         ImageIndex = 10
         OnClick = N3DSetup1Click
       end
+      object MapRenderMode1: TMenuItem
+        Caption = 'Map render mode'
+        object MapRenderRaw1: TMenuItem
+          Caption = 'Raw (all triangles)'
+          Checked = True
+          RadioItem = True
+          OnClick = MapRenderRaw1Click
+        end
+        object MapRenderOutline1: TMenuItem
+          Caption = 'Outline (floor only)'
+          RadioItem = True
+          OnClick = MapRenderOutline1Click
+        end
+      end
       object N12: TMenuItem
         Caption = '-'
       end
@@ -892,20 +906,6 @@ object Form1: TForm1
       object Showbitmapoverlays1: TMenuItem
         Caption = 'Show bitmap overlays'
         OnClick = Showbitmapoverlays1Click
-      end
-      object MapRenderMode1: TMenuItem
-        Caption = 'Map render mode'
-        object MapRenderRaw1: TMenuItem
-          Caption = 'Raw (all triangles)'
-          Checked = True
-          RadioItem = True
-          OnClick = MapRenderRaw1Click
-        end
-        object MapRenderFiltered1: TMenuItem
-          Caption = 'Filtered (floor only)'
-          RadioItem = True
-          OnClick = MapRenderFiltered1Click
-        end
       end
       object InvertYrotation2: TMenuItem
         Caption = 'Invert Y rotation'

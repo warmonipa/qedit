@@ -374,7 +374,7 @@ type
     Showbitmapoverlays1: TMenuItem;
     MapRenderMode1: TMenuItem;
     MapRenderRaw1: TMenuItem;
-    MapRenderFiltered1: TMenuItem;
+    MapRenderOutline1: TMenuItem;
     Markerbrightness1: TMenuItem;
     Default1: TMenuItem;
     High1: TMenuItem;
@@ -604,7 +604,7 @@ type
     procedure showbmpClick(Sender: TObject);
     procedure Showbitmapoverlays1Click(Sender: TObject);
     procedure MapRenderRaw1Click(Sender: TObject);
-    procedure MapRenderFiltered1Click(Sender: TObject);
+    procedure MapRenderOutline1Click(Sender: TObject);
     procedure Default1Click(Sender: TObject);
     procedure High1Click(Sender: TObject);
     procedure Veryhigh1Click(Sender: TObject);
@@ -7209,12 +7209,21 @@ var
   tmppoint: array [0 .. 10000] of array [0 .. 2] of Single;
   pt: array [0 .. 3] of word;
   tpt: array [0 .. 3] of TPoint;
+  // Outline mode variables
+  outlineLnX, outlineLnY: Single;
+  outlineLpt: array[0..3] of word;
+  outlineEdgeArr: array of Int64;
+  outlineEdgeCount, outlineRemY, outlineEi: integer;
+  outlineVa, outlineVb, outlineTmp: word;
+  outlineEk: Int64;
+  outlineTi: integer;
 begin
   if BBRelFile = nil then
     BBRelFile := TMemoryStream.Create;
 
+  BBRelBmp.Canvas.Brush.Color := clWhite;
   BBRelBmp.Canvas.FillRect(BBRelBmp.Canvas.ClipRect);
-  BBRelBmp.Canvas.FloodFill(10, 10, ClWhite, fsBorder);
+  BBRelBmp.Canvas.FloodFill(10, 10, clWhite, fsBorder);
   if BBRelFileName <> filename then
   begin
     BBRelFile.LoadFromFile(filename);
@@ -7353,31 +7362,69 @@ begin
 
         BBRelFile.Seek(t, 0);
         BBRelFile.read(tmppoint, r2 - t); // read point table
+
+        // Mode 1: boundary-edge outline — collect edges, sort, draw only edges that appear once
+        if mapRenderMode = 1 then
+        begin
+          SetLength(outlineEdgeArr, 3 * y);
+          outlineEdgeCount := 0;
+          outlineRemY := y;
+          while outlineRemY > 0 do
+          begin
+            BBRelFile.read(outlineLpt, 8);
+            BBRelFile.read(outlineLnX, 4);
+            BBRelFile.read(outlineLnY, 4);
+            BBRelFile.Seek(20, 1);
+            if ((outlineLpt[3] and 1 = 1) or (outlineLpt[3] and 16 = 16) or (outlineLpt[3] and 64 = 64))
+              and (outlineLnY >= 0.2588) then
+            begin
+              for outlineEi := 0 to 2 do
+              begin
+                outlineVa := outlineLpt[outlineEi];
+                outlineVb := outlineLpt[(outlineEi + 1) mod 3];
+                if outlineVa > outlineVb then
+                begin
+                  outlineTmp := outlineVa;
+                  outlineVa := outlineVb;
+                  outlineVb := outlineTmp;
+                end;
+                outlineEdgeArr[outlineEdgeCount] := Int64(outlineVa) shl 16 or Int64(outlineVb);
+                inc(outlineEdgeCount);
+              end;
+            end;
+            dec(outlineRemY);
+          end;
+          TArray.Sort<Int64>(outlineEdgeArr, TComparer<Int64>.Default, 0, outlineEdgeCount);
+          BBRelBmp.Canvas.Pen.Color := clBlack;
+          outlineTi := 0;
+          while outlineTi < outlineEdgeCount do
+          begin
+            outlineEk := outlineEdgeArr[outlineTi];
+            if (outlineTi + 1 < outlineEdgeCount) and (outlineEdgeArr[outlineTi + 1] = outlineEk) then
+            begin
+              // shared (interior) edge — skip all occurrences
+              while (outlineTi < outlineEdgeCount) and (outlineEdgeArr[outlineTi] = outlineEk) do
+                inc(outlineTi);
+            end
+            else
+            begin
+              // boundary edge — draw it
+              outlineVa := word(outlineEk shr 16);
+              outlineVb := word(outlineEk and $FFFF);
+              BBRelBmp.Canvas.MoveTo(round((tmppoint[outlineVa][0] + mpx) / Zoom) + mmx,
+                                     round((tmppoint[outlineVa][2] + mpy) / Zoom) + mmy);
+              BBRelBmp.Canvas.LineTo(round((tmppoint[outlineVb][0] + mpx) / Zoom) + mmx,
+                                     round((tmppoint[outlineVb][2] + mpy) / Zoom) + mmy);
+              inc(outlineTi);
+            end;
+          end;
+          y := 0; // skip main loop for this block
+        end;
+
         While y > 0 do
         begin
           BBRelFile.read(pt, 8);
-          // Filtered mode: only draw floor triangles (flags bit0/4/6 + normal check)
-          if (mapRenderMode = 1) and not (((pt[3] and 1 = 1) or (pt[3] and 16 = 16) or (pt[3] and 64 = 64))) then
-          begin
-            BBRelFile.Seek(28, 1);
-            dec(y);
-            continue;
-          end;
-          // In filtered mode, read normal Y and check angle < 75 degrees
-          if (mapRenderMode = 1) then
-          begin
-            var normalY: Single;
-            BBRelFile.Seek(4, 1); // skip normal X
-            BBRelFile.read(normalY, 4); // read normal Y
-            BBRelFile.Seek(20, 1); // skip normal Z + 16 bytes padding
-            if normalY < 0.2588 then // cos(75 degrees)
-            begin
-              dec(y);
-              continue;
-            end;
-          end
-          else
-            BBRelFile.Seek(28, 1); // raw mode: skip normal + padding as before
+          BBRelFile.Seek(28, 1); // raw mode: skip normal + padding
 
           if ((round((tmppoint[pt[0]][0] + mpx) / Zoom) >= -mmx) and (round((tmppoint[pt[0]][0] + mpx) / Zoom) <= mmx +
             1) and (round((tmppoint[pt[0]][2] + mpy) / Zoom) >= -mmy) and
@@ -7396,41 +7443,23 @@ begin
             rel[0] := tmppoint[pt[1]][0];
             rel[2] := tmppoint[pt[1]][2];
 
-            if (mapRenderMode = 1) then
+            if (pt[3] and 64 = 64) then
+              BBRelBmp.Canvas.Pen.Color := ClBlue
+            else if (pt[3] and 16 = 16) then
+              BBRelBmp.Canvas.Pen.Color := $7FFF7F
+            else if (pt[3] and 1 = 1) then
             begin
-              // Filtered mode: filled polygon, uniform color
               if darkmode then
-              begin
-                BBRelBmp.Canvas.Brush.Color := RGB(135,135,135);
-                BBRelBmp.Canvas.Pen.Color := RGB(135,135,135);
-              end
+                BBRelBmp.Canvas.Pen.Color := RGB(135,135,135)
               else
-              begin
-                BBRelBmp.Canvas.Brush.Color := $999999;
-                BBRelBmp.Canvas.Pen.Color := $999999;
-              end;
+                BBRelBmp.Canvas.Pen.Color := $999999
             end
             else
             begin
-              // Raw mode: wireframe with color coding (original behavior)
-              if (pt[3] and 64 = 64) then
-                BBRelBmp.Canvas.Pen.Color := ClBlue
-              else if (pt[3] and 16 = 16) then
-                BBRelBmp.Canvas.Pen.Color := $7FFF7F
-              else if (pt[3] and 1 = 1) then
-              begin
-                if darkmode then
-                  BBRelBmp.Canvas.Pen.Color := RGB(135,135,135)
-                else
-                  BBRelBmp.Canvas.Pen.Color := $999999
-              end
+              if darkmode then
+                BBRelBmp.Canvas.Pen.Color := RGB(200,200,200)
               else
-              begin
-                if darkmode then
-                  BBRelBmp.Canvas.Pen.Color := RGB(200,200,200)
-                else
-                  BBRelBmp.Canvas.Pen.Color := clblack;
-              end;
+                BBRelBmp.Canvas.Pen.Color := clblack;
             end;
 
             tpt[0].x := round((rel1[0] + mpx) / Zoom) + mmx;
@@ -7443,10 +7472,7 @@ begin
             tpt[2].x := round((rel[0] + mpx) / Zoom) + mmx;
             tpt[2].y := round((rel[2] + mpy) / Zoom) + mmy;
             tpt[3] := tpt[0];
-            if (mapRenderMode = 1) then
-              BBRelBmp.Canvas.Polygon(Slice(tpt, 3)) // filled polygon
-            else
-              BBRelBmp.Canvas.Polyline(tpt); // wireframe (original)
+            BBRelBmp.Canvas.Polyline(tpt);
           end;
 
           dec(y);
@@ -11986,16 +12012,16 @@ procedure TForm1.MapRenderRaw1Click(Sender: TObject);
 begin
   mapRenderMode := 0;
   MapRenderRaw1.Checked := True;
-  MapRenderFiltered1.Checked := False;
+  MapRenderOutline1.Checked := False;
   BBRelFileName := ''; // force reload
   DrawMap;
 end;
 
-procedure TForm1.MapRenderFiltered1Click(Sender: TObject);
+procedure TForm1.MapRenderOutline1Click(Sender: TObject);
 begin
   mapRenderMode := 1;
   MapRenderRaw1.Checked := False;
-  MapRenderFiltered1.Checked := True;
+  MapRenderOutline1.Checked := True;
   BBRelFileName := ''; // force reload
   DrawMap;
 end;
