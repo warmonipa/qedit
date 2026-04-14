@@ -7,6 +7,7 @@ uses
   ImgList, Dialogs, Math, Menus, StdCtrls, ExtCtrls, CheckLst, ComCtrls, System.Types,
   ShellApi, D3DEngin, registry, Spin, System.ImageList, System.Generics.Collections,
   System.Generics.Defaults, StrUtils, System.Actions, System.IOUtils, Vcl.ActnList, Vcl.Themes,
+  Winapi.GDIPAPI, Winapi.GDIPOBJ, Winapi.GDIPUTIL,
   Vcl.Styles, Data.DB, Datasnap.DBClient, Vcl.Grids, Vcl.DBGrids, Vcl.Buttons, Vcl.DBCtrls;
 
 const
@@ -817,6 +818,15 @@ var
   BBRelFileName: ansistring;
   BBRelFile: TMemoryStream = nil;
   BBRelBmp: TBitmap;
+  // Outline-mode cache (invalidated when filename changes)
+  cachedOutlineFor: ansistring = '';
+  cachedOutlineContours: TArray<TArray<TGPPointF>>;   // world-space XZ per contour
+  cachedOutlineAvgY: TArray<Single>;
+  cachedOutlineParent: TArray<Integer>;
+  cachedOutlineDepth: TArray<Integer>;
+  cachedOutlineCount: Integer = 0;
+  cachedOutlineMinY: Single = 0;
+  cachedOutlineMaxY: Single = 0;
   TrData, TrFnc, TrReg, Tropc, TrTmp: ttreenode;
   TsData, TsFnc, TsReg, Tsopc, Monsterini: tstringlist;
   showwave: integer = -1;
@@ -7199,6 +7209,150 @@ begin
   end;
 end;
 
+procedure DouglasPeuckerRec(const pts: TArray<TGPPointF>; tol2: Single;
+  lo, hi: Integer; var keep: TArray<Boolean>);
+var
+  maxDist2, d2, dx, dy, len2, t, projX, projY, ax, ay, bx, by: Single;
+  maxIdx, i: Integer;
+begin
+  if hi <= lo + 1 then Exit;
+  ax := pts[lo].X; ay := pts[lo].Y;
+  bx := pts[hi].X; by := pts[hi].Y;
+  dx := bx - ax; dy := by - ay;
+  len2 := dx * dx + dy * dy;
+  maxDist2 := 0;
+  maxIdx := -1;
+  for i := lo + 1 to hi - 1 do
+  begin
+    if len2 < 1e-9 then
+    begin
+      dx := pts[i].X - ax;
+      dy := pts[i].Y - ay;
+      d2 := dx * dx + dy * dy;
+    end
+    else
+    begin
+      t := ((pts[i].X - ax) * (bx - ax) + (pts[i].Y - ay) * (by - ay)) / len2;
+      if t < 0 then t := 0 else if t > 1 then t := 1;
+      projX := ax + t * (bx - ax);
+      projY := ay + t * (by - ay);
+      dx := pts[i].X - projX;
+      dy := pts[i].Y - projY;
+      d2 := dx * dx + dy * dy;
+    end;
+    if d2 > maxDist2 then
+    begin
+      maxDist2 := d2;
+      maxIdx := i;
+    end;
+  end;
+  if (maxIdx >= 0) and (maxDist2 > tol2) then
+  begin
+    keep[maxIdx] := True;
+    DouglasPeuckerRec(pts, tol2, lo, maxIdx, keep);
+    DouglasPeuckerRec(pts, tol2, maxIdx, hi, keep);
+  end;
+end;
+
+function SimplifyContour(const pts: TArray<TGPPointF>; tol: Single): TArray<TGPPointF>;
+var
+  keep: TArray<Boolean>;
+  i, n, k: Integer;
+begin
+  n := Length(pts);
+  if n <= 4 then
+  begin
+    SetLength(Result, n);
+    for i := 0 to n - 1 do Result[i] := pts[i];
+    Exit;
+  end;
+  SetLength(keep, n);
+  keep[0] := True;
+  keep[n - 1] := True;
+  DouglasPeuckerRec(pts, tol * tol, 0, n - 1, keep);
+  k := 0;
+  for i := 0 to n - 1 do if keep[i] then Inc(k);
+  SetLength(Result, k);
+  k := 0;
+  for i := 0 to n - 1 do
+    if keep[i] then
+    begin
+      Result[k] := pts[i];
+      Inc(k);
+    end;
+end;
+
+function PolygonSignedArea(const pts: TArray<TGPPointF>): Double;
+var
+  i, n: Integer;
+begin
+  n := Length(pts);
+  Result := 0;
+  if n < 3 then Exit;
+  for i := 0 to n - 1 do
+    Result := Result + pts[i].X * pts[(i + 1) mod n].Y - pts[(i + 1) mod n].X * pts[i].Y;
+  Result := Result * 0.5;
+end;
+
+function PolygonCentroid(const pts: TArray<TGPPointF>): TGPPointF;
+var
+  i, n: Integer;
+  cx, cy, a, cross: Double;
+begin
+  n := Length(pts);
+  if n = 0 then
+  begin
+    Result.X := 0; Result.Y := 0; Exit;
+  end;
+  cx := 0; cy := 0; a := 0;
+  for i := 0 to n - 1 do
+  begin
+    cross := pts[i].X * pts[(i + 1) mod n].Y - pts[(i + 1) mod n].X * pts[i].Y;
+    cx := cx + (pts[i].X + pts[(i + 1) mod n].X) * cross;
+    cy := cy + (pts[i].Y + pts[(i + 1) mod n].Y) * cross;
+    a := a + cross;
+  end;
+  if Abs(a) < 1e-9 then
+  begin
+    Result.X := pts[0].X;
+    Result.Y := pts[0].Y;
+    Exit;
+  end;
+  Result.X := Single(cx / (3 * a));
+  Result.Y := Single(cy / (3 * a));
+end;
+
+function CreateRoundedRectPath(x, y, w, h, r: Single): TGPGraphicsPath;
+begin
+  Result := TGPGraphicsPath.Create;
+  if r * 2 > w then r := w / 2;
+  if r * 2 > h then r := h / 2;
+  Result.AddArc(x,             y,             2 * r, 2 * r, 180, 90);
+  Result.AddArc(x + w - 2 * r, y,             2 * r, 2 * r, 270, 90);
+  Result.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r,   0, 90);
+  Result.AddArc(x,             y + h - 2 * r, 2 * r, 2 * r,  90, 90);
+  Result.CloseFigure;
+end;
+
+function PointInPolygon(const p: TGPPointF; const pts: TArray<TGPPointF>): Boolean;
+var
+  i, j, n: Integer;
+  inside: Boolean;
+begin
+  n := Length(pts);
+  inside := False;
+  if n < 3 then Exit(False);
+  j := n - 1;
+  for i := 0 to n - 1 do
+  begin
+    if ((pts[i].Y > p.Y) <> (pts[j].Y > p.Y)) and
+       (p.X < (pts[j].X - pts[i].X) * (p.Y - pts[i].Y) / (pts[j].Y - pts[i].Y) + pts[i].X) then
+      inside := not inside;
+    j := i;
+  end;
+  Result := inside;
+end;
+
 procedure TForm1.DrawBBRELFile(filename: ansistring);
 var
   rel, rel1: array [0 .. 2] of Single;
@@ -7217,6 +7371,51 @@ var
   outlineVa, outlineVb, outlineTmp: word;
   outlineEk: Int64;
   outlineTi: integer;
+  // Contour tracing
+  boundaryEdges: array of record a, b: word; used: boolean; end;
+  boundaryCount, seedEi, adjIdx, adjEi: integer;
+  vertAdj: TDictionary<word, TList<integer>>;
+  adjList: TList<integer>;
+  contourPts: TArray<TGPPointF>;
+  contourLen, cIdx: integer;
+  curV, nextV, startV: word;
+  foundNext: boolean;
+  contoursPts: TArray<TArray<TGPPointF>>;
+  contoursAvgY: TArray<Single>;
+  contoursCount: integer;
+  sumY: Double;
+  vCount: integer;
+  contMinY, contMaxY, heightT, shadowOffset: Single;
+  lowR, lowG, lowB, highR, highG, highB, strokeR, strokeG, strokeB: Byte;
+  fillR, fillG, fillB: Byte;
+  gpGraphics: TGPGraphics;
+  gpBrush, gpShadowBrush: TGPSolidBrush;
+  gpPen: TGPPen;
+  contoursCentroid: TArray<TGPPointF>;
+  contoursArea: TArray<Double>;
+  contoursParent: TArray<Integer>;
+  contoursDepth: TArray<Integer>;
+  contourPaths: TArray<TGPGraphicsPath>;
+  pIdx, depthWalker, bestParent, projIdx: Integer;
+  bestParentArea: Double;
+  projectedPts: TArray<TArray<TGPPointF>>;
+  screenTemp: TArray<TGPPointF>;
+  gpRawGraphics: TGPGraphics;
+  gpPenBlue, gpPenGreen, gpPenGray, gpPenDefault, curPen: TGPPen;
+  gpTrianglePts: array[0..2] of TGPPointF;
+  combinedPath: TGPGraphicsPath;
+  hatchBrush: TGPHatchBrush;
+  lgCardPath, lgBarPath: TGPGraphicsPath;
+  lgCardBrush, lgTextBrush, lgCardShadowBrush: TGPSolidBrush;
+  lgGradBrush: TGPLinearGradientBrush;
+  lgCardPen, lgBarPen: TGPPen;
+  lgFontFamily: TGPFontFamily;
+  lgFont: TGPFont;
+  lgStringFormat: TGPStringFormat;
+  lgPt: TGPPointF;
+  lgRectF: TGPRectF;
+  lgTextRect: TRect;
+  lgX, lgY, lgW, lgH, lgBarX, lgBarY, lgBarW, lgBarH: Integer;
 begin
   if BBRelFile = nil then
     BBRelFile := TMemoryStream.Create;
@@ -7348,6 +7547,48 @@ begin
     l := 1;
     ll := 0;
     col := $101010;
+    // Raw mode: set up GDI+ graphics + pens once, reused for every triangle
+    gpRawGraphics := nil;
+    gpPenBlue := nil; gpPenGreen := nil; gpPenGray := nil; gpPenDefault := nil;
+    if mapRenderMode = 0 then
+    begin
+      gpRawGraphics := TGPGraphics.Create(BBRelBmp.Canvas.Handle);
+      gpRawGraphics.SetSmoothingMode(SmoothingModeAntiAlias);
+      gpRawGraphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+      gpPenBlue := TGPPen.Create(MakeColor(255, 0, 0, 255), 1);
+      gpPenGreen := TGPPen.Create(MakeColor(255, 127, 255, 127), 1);
+      if darkmode then
+      begin
+        gpPenGray := TGPPen.Create(MakeColor(255, 135, 135, 135), 1);
+        gpPenDefault := TGPPen.Create(MakeColor(255, 200, 200, 200), 1);
+      end
+      else
+      begin
+        gpPenGray := TGPPen.Create(MakeColor(255, 153, 153, 153), 1);
+        gpPenDefault := TGPPen.Create(MakeColor(255, 0, 0, 0), 1);
+      end;
+    end;
+
+    // Outline cache: if filename unchanged and mode 1, reuse prior world-space contours
+    if (mapRenderMode = 1) and (cachedOutlineFor = filename) and (cachedOutlineCount > 0) then
+    begin
+      contoursCount := cachedOutlineCount;
+      contoursPts := Copy(cachedOutlineContours, 0, cachedOutlineCount);
+      contoursAvgY := Copy(cachedOutlineAvgY, 0, cachedOutlineCount);
+      contoursParent := Copy(cachedOutlineParent, 0, cachedOutlineCount);
+      contoursDepth := Copy(cachedOutlineDepth, 0, cachedOutlineCount);
+      contMinY := cachedOutlineMinY;
+      contMaxY := cachedOutlineMaxY;
+      l := 0; // skip outer while loop
+    end
+    else
+    begin
+      contoursCount := 0;
+      SetLength(contoursPts, 0);
+      SetLength(contoursAvgY, 0);
+      contMinY := 1e30;
+      contMaxY := -1e30;
+    end;
     while l = 1 do
     begin
       BBRelFile.read(r, 4);
@@ -7363,7 +7604,7 @@ begin
         BBRelFile.Seek(t, 0);
         BBRelFile.read(tmppoint, r2 - t); // read point table
 
-        // Mode 1: boundary-edge outline — collect edges, sort, draw only edges that appear once
+        // Mode 1: floor-contour outline — trace boundary edges into closed polygons, fill + stroke
         if mapRenderMode = 1 then
         begin
           SetLength(outlineEdgeArr, 3 * y);
@@ -7395,29 +7636,115 @@ begin
             dec(outlineRemY);
           end;
           TArray.Sort<Int64>(outlineEdgeArr, TComparer<Int64>.Default, 0, outlineEdgeCount);
-          BBRelBmp.Canvas.Pen.Color := clBlack;
+
+          // Extract boundary edges (those appearing exactly once)
+          SetLength(boundaryEdges, outlineEdgeCount);
+          boundaryCount := 0;
           outlineTi := 0;
           while outlineTi < outlineEdgeCount do
           begin
             outlineEk := outlineEdgeArr[outlineTi];
             if (outlineTi + 1 < outlineEdgeCount) and (outlineEdgeArr[outlineTi + 1] = outlineEk) then
             begin
-              // shared (interior) edge — skip all occurrences
               while (outlineTi < outlineEdgeCount) and (outlineEdgeArr[outlineTi] = outlineEk) do
                 inc(outlineTi);
             end
             else
             begin
-              // boundary edge — draw it
-              outlineVa := word(outlineEk shr 16);
-              outlineVb := word(outlineEk and $FFFF);
-              BBRelBmp.Canvas.MoveTo(round((tmppoint[outlineVa][0] + mpx) / Zoom) + mmx,
-                                     round((tmppoint[outlineVa][2] + mpy) / Zoom) + mmy);
-              BBRelBmp.Canvas.LineTo(round((tmppoint[outlineVb][0] + mpx) / Zoom) + mmx,
-                                     round((tmppoint[outlineVb][2] + mpy) / Zoom) + mmy);
+              boundaryEdges[boundaryCount].a := word(outlineEk shr 16);
+              boundaryEdges[boundaryCount].b := word(outlineEk and $FFFF);
+              boundaryEdges[boundaryCount].used := false;
+              inc(boundaryCount);
               inc(outlineTi);
             end;
           end;
+
+          // Build vertex -> boundary-edge adjacency
+          vertAdj := TDictionary<word, TList<integer>>.Create;
+          try
+            for outlineEi := 0 to boundaryCount - 1 do
+            begin
+              if not vertAdj.TryGetValue(boundaryEdges[outlineEi].a, adjList) then
+              begin
+                adjList := TList<integer>.Create;
+                vertAdj.Add(boundaryEdges[outlineEi].a, adjList);
+              end;
+              adjList.Add(outlineEi);
+              if not vertAdj.TryGetValue(boundaryEdges[outlineEi].b, adjList) then
+              begin
+                adjList := TList<integer>.Create;
+                vertAdj.Add(boundaryEdges[outlineEi].b, adjList);
+              end;
+              adjList.Add(outlineEi);
+            end;
+
+            // Walk each contour loop starting from any unused edge; append to global list
+            for seedEi := 0 to boundaryCount - 1 do
+            begin
+              if boundaryEdges[seedEi].used then continue;
+              SetLength(contourPts, 64);
+              contourLen := 0;
+              sumY := 0;
+              vCount := 0;
+              startV := boundaryEdges[seedEi].a;
+              curV := startV;
+              nextV := boundaryEdges[seedEi].b;
+              boundaryEdges[seedEi].used := true;
+
+              contourPts[contourLen].X := tmppoint[curV][0];
+              contourPts[contourLen].Y := tmppoint[curV][2];
+              sumY := sumY + tmppoint[curV][1];
+              inc(vCount);
+              inc(contourLen);
+
+              repeat
+                if contourLen >= Length(contourPts) then
+                  SetLength(contourPts, Length(contourPts) * 2);
+                contourPts[contourLen].X := tmppoint[nextV][0];
+                contourPts[contourLen].Y := tmppoint[nextV][2];
+                sumY := sumY + tmppoint[nextV][1];
+                inc(vCount);
+                inc(contourLen);
+
+                curV := nextV;
+                if curV = startV then break;
+                foundNext := false;
+                if vertAdj.TryGetValue(curV, adjList) then
+                begin
+                  for adjIdx := 0 to adjList.Count - 1 do
+                  begin
+                    adjEi := adjList[adjIdx];
+                    if boundaryEdges[adjEi].used then continue;
+                    if boundaryEdges[adjEi].a = curV then
+                      nextV := boundaryEdges[adjEi].b
+                    else
+                      nextV := boundaryEdges[adjEi].a;
+                    boundaryEdges[adjEi].used := true;
+                    foundNext := true;
+                    break;
+                  end;
+                end;
+              until not foundNext;
+
+              if contourLen >= 3 then
+              begin
+                SetLength(contourPts, contourLen);
+                SetLength(contoursPts, contoursCount + 1);
+                SetLength(contoursAvgY, contoursCount + 1);
+                contoursPts[contoursCount] := Copy(contourPts, 0, contourLen);
+                contoursAvgY[contoursCount] := sumY / vCount;
+                if contoursAvgY[contoursCount] < contMinY then contMinY := contoursAvgY[contoursCount];
+                if contoursAvgY[contoursCount] > contMaxY then contMaxY := contoursAvgY[contoursCount];
+                inc(contoursCount);
+              end;
+            end;
+
+          finally
+            for adjList in vertAdj.Values do
+              adjList.Free;
+            vertAdj.Free;
+          end;
+
           y := 0; // skip main loop for this block
         end;
 
@@ -7444,35 +7771,23 @@ begin
             rel[2] := tmppoint[pt[1]][2];
 
             if (pt[3] and 64 = 64) then
-              BBRelBmp.Canvas.Pen.Color := ClBlue
+              curPen := gpPenBlue
             else if (pt[3] and 16 = 16) then
-              BBRelBmp.Canvas.Pen.Color := $7FFF7F
+              curPen := gpPenGreen
             else if (pt[3] and 1 = 1) then
-            begin
-              if darkmode then
-                BBRelBmp.Canvas.Pen.Color := RGB(135,135,135)
-              else
-                BBRelBmp.Canvas.Pen.Color := $999999
-            end
+              curPen := gpPenGray
             else
-            begin
-              if darkmode then
-                BBRelBmp.Canvas.Pen.Color := RGB(200,200,200)
-              else
-                BBRelBmp.Canvas.Pen.Color := clblack;
-            end;
+              curPen := gpPenDefault;
 
-            tpt[0].x := round((rel1[0] + mpx) / Zoom) + mmx;
-            tpt[0].y := round((rel1[2] + mpy) / Zoom) + mmy;
-
-            tpt[1].x := round((rel[0] + mpx) / Zoom) + mmx;
-            tpt[1].y := round((rel[2] + mpy) / Zoom) + mmy;
+            gpTrianglePts[0].X := (rel1[0] + mpx) / Zoom + mmx;
+            gpTrianglePts[0].Y := (rel1[2] + mpy) / Zoom + mmy;
+            gpTrianglePts[1].X := (rel[0] + mpx) / Zoom + mmx;
+            gpTrianglePts[1].Y := (rel[2] + mpy) / Zoom + mmy;
             rel[0] := tmppoint[pt[2]][0];
             rel[2] := tmppoint[pt[2]][2];
-            tpt[2].x := round((rel[0] + mpx) / Zoom) + mmx;
-            tpt[2].y := round((rel[2] + mpy) / Zoom) + mmy;
-            tpt[3] := tpt[0];
-            BBRelBmp.Canvas.Polyline(tpt);
+            gpTrianglePts[2].X := (rel[0] + mpx) / Zoom + mmx;
+            gpTrianglePts[2].Y := (rel[2] + mpy) / Zoom + mmy;
+            gpRawGraphics.DrawPolygon(curPen, PGPPointF(@gpTrianglePts[0]), 3);
           end;
 
           dec(y);
@@ -7487,6 +7802,279 @@ begin
       // inc(sec);
     end;
     // deletedc(hd);
+
+    // Tear down raw-mode GDI+ state (outline mode creates its own TGPGraphics later)
+    if mapRenderMode = 0 then
+    begin
+      if gpPenBlue <> nil then gpPenBlue.Free;
+      if gpPenGreen <> nil then gpPenGreen.Free;
+      if gpPenGray <> nil then gpPenGray.Free;
+      if gpPenDefault <> nil then gpPenDefault.Free;
+      if gpRawGraphics <> nil then gpRawGraphics.Free;
+    end;
+
+    // Cache miss path: compute nesting topology once on world-space contours, then persist
+    if (mapRenderMode = 1) and (contoursCount > 0) and (cachedOutlineFor <> filename) then
+    begin
+      SetLength(contoursCentroid, contoursCount);
+      SetLength(contoursArea, contoursCount);
+      for cIdx := 0 to contoursCount - 1 do
+      begin
+        contoursCentroid[cIdx] := PolygonCentroid(contoursPts[cIdx]);
+        contoursArea[cIdx] := Abs(PolygonSignedArea(contoursPts[cIdx]));
+      end;
+
+      SetLength(contoursParent, contoursCount);
+      for cIdx := 0 to contoursCount - 1 do
+      begin
+        bestParent := -1;
+        bestParentArea := 1e30;
+        for pIdx := 0 to contoursCount - 1 do
+        begin
+          if pIdx = cIdx then Continue;
+          if contoursArea[pIdx] <= contoursArea[cIdx] then Continue;
+          if PointInPolygon(contoursCentroid[cIdx], contoursPts[pIdx]) and
+             (contoursArea[pIdx] < bestParentArea) then
+          begin
+            bestParent := pIdx;
+            bestParentArea := contoursArea[pIdx];
+          end;
+        end;
+        contoursParent[cIdx] := bestParent;
+      end;
+
+      SetLength(contoursDepth, contoursCount);
+      for cIdx := 0 to contoursCount - 1 do
+      begin
+        depthWalker := contoursParent[cIdx];
+        contoursDepth[cIdx] := 0;
+        while depthWalker >= 0 do
+        begin
+          Inc(contoursDepth[cIdx]);
+          depthWalker := contoursParent[depthWalker];
+        end;
+      end;
+
+      // One-time world-space DP simplification: cuts 30-60% of vertices, skips per-frame DP
+      for cIdx := 0 to contoursCount - 1 do
+        contoursPts[cIdx] := SimplifyContour(contoursPts[cIdx], 1.0);
+
+      cachedOutlineFor := filename;
+      cachedOutlineContours := Copy(contoursPts, 0, contoursCount);
+      cachedOutlineAvgY := Copy(contoursAvgY, 0, contoursCount);
+      cachedOutlineParent := Copy(contoursParent, 0, contoursCount);
+      cachedOutlineDepth := Copy(contoursDepth, 0, contoursCount);
+      cachedOutlineCount := contoursCount;
+      cachedOutlineMinY := contMinY;
+      cachedOutlineMaxY := contMaxY;
+    end;
+
+    // Mode 1 render: project world -> screen, DP-simplify, build hole-aware paths, GDI+ render
+    if (mapRenderMode = 1) and (contoursCount > 0) then
+    begin
+      SetLength(projectedPts, contoursCount);
+      for cIdx := 0 to contoursCount - 1 do
+      begin
+        SetLength(projectedPts[cIdx], Length(contoursPts[cIdx]));
+        for projIdx := 0 to Length(contoursPts[cIdx]) - 1 do
+        begin
+          projectedPts[cIdx][projIdx].X := (contoursPts[cIdx][projIdx].X + mpx) / Zoom + mmx;
+          projectedPts[cIdx][projIdx].Y := (contoursPts[cIdx][projIdx].Y + mpy) / Zoom + mmy;
+        end;
+      end;
+
+      SetLength(contourPaths, contoursCount);
+      for cIdx := 0 to contoursCount - 1 do
+      begin
+        if (contoursDepth[cIdx] mod 2) = 0 then
+        begin
+          contourPaths[cIdx] := TGPGraphicsPath.Create(FillModeAlternate);
+          contourPaths[cIdx].AddPolygon(PGPPointF(@projectedPts[cIdx][0]), Length(projectedPts[cIdx]));
+          for pIdx := 0 to contoursCount - 1 do
+            if contoursParent[pIdx] = cIdx then
+              contourPaths[cIdx].AddPolygon(PGPPointF(@projectedPts[pIdx][0]), Length(projectedPts[pIdx]));
+        end
+        else
+          contourPaths[cIdx] := nil;
+      end;
+
+      if darkmode then
+      begin
+        lowR := 65;  lowG := 85;   lowB := 115;
+        highR := 140; highG := 110; highB := 75;
+        strokeR := 220; strokeG := 220; strokeB := 220;
+      end
+      else
+      begin
+        lowR := 165; lowG := 188; lowB := 218;
+        highR := 228; highG := 200; highB := 168;
+        strokeR := 30; strokeG := 30; strokeB := 30;
+      end;
+      shadowOffset := outlinewidth + 1.5;
+
+      gpGraphics := TGPGraphics.Create(BBRelBmp.Canvas.Handle);
+      try
+        gpGraphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        gpGraphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+
+        // Hatch pass: faint 45° diagonal lines outside floor areas (cartographic negative space)
+        combinedPath := TGPGraphicsPath.Create(FillModeAlternate);
+        try
+          for cIdx := 0 to contoursCount - 1 do
+            if contourPaths[cIdx] <> nil then
+              combinedPath.AddPath(contourPaths[cIdx], False);
+          gpGraphics.SetClip(combinedPath, CombineModeExclude);
+          hatchBrush := TGPHatchBrush.Create(HatchStyleForwardDiagonal,
+            MakeColor(32, 0, 0, 0), MakeColor(0, 0, 0, 0));
+          try
+            gpGraphics.FillRectangle(hatchBrush, 0.0, 0.0,
+              Single(BBRelBmp.Width), Single(BBRelBmp.Height));
+          finally
+            hatchBrush.Free;
+          end;
+          gpGraphics.ResetClip;
+        finally
+          combinedPath.Free;
+        end;
+
+        // Shadow pass: single wide AA stroke (soft edge) + solid fill (core)
+        gpShadowBrush := TGPSolidBrush.Create(MakeColor(55, 0, 0, 0));
+        try
+          gpGraphics.TranslateTransform(shadowOffset, shadowOffset);
+          gpPen := TGPPen.Create(MakeColor(28, 0, 0, 0), outlinewidth + 3);
+          try
+            gpPen.SetLineJoin(LineJoinRound);
+            for cIdx := 0 to contoursCount - 1 do
+              if contourPaths[cIdx] <> nil then
+                gpGraphics.DrawPath(gpPen, contourPaths[cIdx]);
+          finally
+            gpPen.Free;
+          end;
+          for cIdx := 0 to contoursCount - 1 do
+            if contourPaths[cIdx] <> nil then
+              gpGraphics.FillPath(gpShadowBrush, contourPaths[cIdx]);
+          gpGraphics.ResetTransform;
+        finally
+          gpShadowBrush.Free;
+        end;
+
+        // Fill + stroke pass with height-tinted color per outer
+        gpPen := TGPPen.Create(MakeColor(255, strokeR, strokeG, strokeB), outlinewidth);
+        try
+          gpPen.SetLineJoin(LineJoinRound);
+          for cIdx := 0 to contoursCount - 1 do
+          begin
+            if contourPaths[cIdx] = nil then Continue;
+            if contMaxY > contMinY then
+              heightT := (contoursAvgY[cIdx] - contMinY) / (contMaxY - contMinY)
+            else
+              heightT := 0.5;
+            fillR := Byte(Round(lowR + (Integer(highR) - Integer(lowR)) * heightT));
+            fillG := Byte(Round(lowG + (Integer(highG) - Integer(lowG)) * heightT));
+            fillB := Byte(Round(lowB + (Integer(highB) - Integer(lowB)) * heightT));
+            gpBrush := TGPSolidBrush.Create(MakeColor(235, fillR, fillG, fillB));
+            try
+              gpGraphics.FillPath(gpBrush, contourPaths[cIdx]);
+            finally
+              gpBrush.Free;
+            end;
+            gpGraphics.DrawPath(gpPen, contourPaths[cIdx]);
+          end;
+        finally
+          gpPen.Free;
+        end;
+
+        // Height legend: horizontal pill — "Height:  LOW [==gradient==] HIGH"
+        lgW := 320;
+        lgH := 28;
+        lgX := BBRelBmp.Width - lgW - 16;
+        lgY := BBRelBmp.Height - lgH - 16;
+        lgBarW := 130;
+        lgBarH := 10;
+        lgBarX := lgX + 128;
+        lgBarY := lgY + (lgH - lgBarH) div 2;
+
+        lgCardPath := CreateRoundedRectPath(Single(lgX), Single(lgY), Single(lgW), Single(lgH), Single(lgH) / 2);
+        try
+          gpGraphics.TranslateTransform(0.0, 2.0);
+          lgCardShadowBrush := TGPSolidBrush.Create(MakeColor(40, 0, 0, 0));
+          try
+            gpGraphics.FillPath(lgCardShadowBrush, lgCardPath);
+          finally
+            lgCardShadowBrush.Free;
+          end;
+          gpGraphics.ResetTransform;
+
+          lgCardBrush := TGPSolidBrush.Create(MakeColor(245, 255, 255, 255));
+          try
+            gpGraphics.FillPath(lgCardBrush, lgCardPath);
+          finally
+            lgCardBrush.Free;
+          end;
+
+          lgCardPen := TGPPen.Create(MakeColor(130, 140, 140, 140), 1);
+          try
+            gpGraphics.DrawPath(lgCardPen, lgCardPath);
+          finally
+            lgCardPen.Free;
+          end;
+        finally
+          lgCardPath.Free;
+        end;
+
+        lgBarPath := CreateRoundedRectPath(Single(lgBarX), Single(lgBarY), Single(lgBarW), Single(lgBarH), Single(lgBarH) / 2);
+        try
+          lgGradBrush := TGPLinearGradientBrush.Create(
+            MakePoint(Single(lgBarX), Single(lgBarY)),
+            MakePoint(Single(lgBarX + lgBarW), Single(lgBarY)),
+            MakeColor(255, lowR, lowG, lowB),
+            MakeColor(255, highR, highG, highB));
+          try
+            gpGraphics.FillPath(lgGradBrush, lgBarPath);
+          finally
+            lgGradBrush.Free;
+          end;
+
+          lgBarPen := TGPPen.Create(MakeColor(140, 80, 80, 80), 1);
+          try
+            gpGraphics.DrawPath(lgBarPen, lgBarPath);
+          finally
+            lgBarPen.Free;
+          end;
+        finally
+          lgBarPath.Free;
+        end;
+
+      finally
+        gpGraphics.Free;
+        for cIdx := 0 to contoursCount - 1 do
+          if contourPaths[cIdx] <> nil then contourPaths[cIdx].Free;
+      end;
+
+      // Legend labels via GDI Canvas (reliable across system font configs)
+      BBRelBmp.Canvas.Brush.Style := bsClear;
+
+      // Title "Height:" on the left
+      BBRelBmp.Canvas.Font.Name := 'Segoe UI';
+      BBRelBmp.Canvas.Font.Size := 9;
+      BBRelBmp.Canvas.Font.Style := [fsBold];
+      BBRelBmp.Canvas.Font.Color := RGB(30, 35, 45);
+      lgTextRect := Rect(lgX + 14, lgY, lgX + 78, lgY + lgH);
+      DrawText(BBRelBmp.Canvas.Handle, 'Height:', 7, lgTextRect,
+        DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX);
+
+      // LOW / HIGH small labels flanking the bar
+      BBRelBmp.Canvas.Font.Size := 8;
+      BBRelBmp.Canvas.Font.Color := RGB(70, 75, 85);
+      lgTextRect := Rect(lgX + 82, lgY, lgBarX - 4, lgY + lgH);
+      DrawText(BBRelBmp.Canvas.Handle, 'LOW', 3, lgTextRect,
+        DT_RIGHT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX);
+      lgTextRect := Rect(lgBarX + lgBarW + 4, lgY, lgX + lgW - 10, lgY + lgH);
+      DrawText(BBRelBmp.Canvas.Handle, 'HIGH', 4, lgTextRect,
+        DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX);
+
+      BBRelBmp.Canvas.Brush.Style := bsSolid;
+    end;
 
     BBRelBmp.Canvas.Pen.Color := 0;
     // fileclose(f);
@@ -12014,6 +12602,7 @@ begin
   MapRenderRaw1.Checked := True;
   MapRenderOutline1.Checked := False;
   BBRelFileName := ''; // force reload
+  cachedOutlineFor := ''; cachedOutlineCount := 0;
   DrawMap;
 end;
 
@@ -12023,6 +12612,7 @@ begin
   MapRenderRaw1.Checked := False;
   MapRenderOutline1.Checked := True;
   BBRelFileName := ''; // force reload
+  cachedOutlineFor := ''; cachedOutlineCount := 0;
   DrawMap;
 end;
 
