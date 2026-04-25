@@ -374,8 +374,8 @@ type
     showbmp: TMenuItem;
     Showbitmapoverlays1: TMenuItem;
     MapRenderMode1: TMenuItem;
-    MapRenderRaw1: TMenuItem;
-    MapRenderOutline1: TMenuItem;
+    MapRenderWireframe1: TMenuItem;
+    MapRenderTopographic1: TMenuItem;
     Markerbrightness1: TMenuItem;
     Default1: TMenuItem;
     High1: TMenuItem;
@@ -604,8 +604,8 @@ type
     procedure Image2Paint(Sender: TObject);
     procedure showbmpClick(Sender: TObject);
     procedure Showbitmapoverlays1Click(Sender: TObject);
-    procedure MapRenderRaw1Click(Sender: TObject);
-    procedure MapRenderOutline1Click(Sender: TObject);
+    procedure MapRenderWireframe1Click(Sender: TObject);
+    procedure MapRenderTopographic1Click(Sender: TObject);
     procedure Default1Click(Sender: TObject);
     procedure High1Click(Sender: TObject);
     procedure Veryhigh1Click(Sender: TObject);
@@ -827,6 +827,10 @@ var
   cachedOutlineCount: Integer = 0;
   cachedOutlineMinY: Single = 0;
   cachedOutlineMaxY: Single = 0;
+  // Interior edges (shared between two triangles) — drawn as fine triangulation
+  // inside contour-traced rooms. Flat 2N array: consecutive pairs are line segments.
+  cachedOutlineInterior: TArray<TGPPointF>;
+  cachedOutlineInteriorCount: Integer = 0;
   TrData, TrFnc, TrReg, Tropc, TrTmp: ttreenode;
   TsData, TsFnc, TsReg, Tsopc, Monsterini: tstringlist;
   showwave: integer = -1;
@@ -903,7 +907,7 @@ var
   placelookat: Boolean = false;
   placerotation: integer = 0;
   darkmode: Boolean = false;
-  mapRenderMode: integer = 0; // 0=raw (default), 1=filtered (floor only)
+  mapRenderMode: integer = 0; // 0=wireframe (every triangle outlined), 1=topographic (height-tinted contours + interior triangulation)
   previewstate: integer = 0;
   previewstring: string;
   previewpaused: Boolean = false;
@@ -7403,6 +7407,15 @@ var
   gpRawGraphics: TGPGraphics;
   gpPenBlue, gpPenGreen, gpPenGray, gpPenDefault, curPen: TGPPen;
   gpTrianglePts: array[0..2] of TGPPointF;
+  // Topographic mode: thin pen for interior (shared) edges painted between fill and boundary.
+  topoInteriorPen: TGPPen;
+  topoIeIdx: Integer;
+  // Per-section interior edges (world-XZ pairs), appended into the global cache after
+  // the section's edge sort/classification step.
+  interiorPts: TArray<TGPPointF>;
+  interiorCount: Integer;
+  interiorVa, interiorVb: word;
+  topoIntS1, topoIntS2: TGPPointF;
   combinedPath: TGPGraphicsPath;
   hatchBrush: TGPHatchBrush;
   lgCardPath, lgBarPath: TGPGraphicsPath;
@@ -7550,6 +7563,7 @@ begin
     // Raw mode: set up GDI+ graphics + pens once, reused for every triangle
     gpRawGraphics := nil;
     gpPenBlue := nil; gpPenGreen := nil; gpPenGray := nil; gpPenDefault := nil;
+    topoInteriorPen := nil;
     if mapRenderMode = 0 then
     begin
       gpRawGraphics := TGPGraphics.Create(BBRelBmp.Canvas.Handle);
@@ -7569,7 +7583,9 @@ begin
       end;
     end;
 
-    // Outline cache: if filename unchanged and mode 1, reuse prior world-space contours
+    // Topographic cache: if filename unchanged, reuse prior world-space contours + interior edges
+    interiorCount := 0;
+    SetLength(interiorPts, 0);
     if (mapRenderMode = 1) and (cachedOutlineFor = filename) and (cachedOutlineCount > 0) then
     begin
       contoursCount := cachedOutlineCount;
@@ -7579,6 +7595,8 @@ begin
       contoursDepth := Copy(cachedOutlineDepth, 0, cachedOutlineCount);
       contMinY := cachedOutlineMinY;
       contMaxY := cachedOutlineMaxY;
+      interiorCount := cachedOutlineInteriorCount;
+      interiorPts := Copy(cachedOutlineInterior, 0, cachedOutlineInteriorCount);
       l := 0; // skip outer while loop
     end
     else
@@ -7637,15 +7655,27 @@ begin
           end;
           TArray.Sort<Int64>(outlineEdgeArr, TComparer<Int64>.Default, 0, outlineEdgeCount);
 
-          // Extract boundary edges (those appearing exactly once)
+          // Classify edges: singleton -> boundary (room frame, traced into contours);
+          // duplicate -> interior (shared between two triangles, drawn as fine triangulation).
           SetLength(boundaryEdges, outlineEdgeCount);
           boundaryCount := 0;
+          // Reserve interior buffer in this section: at most outlineEdgeCount/2 interior edges
+          if Length(interiorPts) < (interiorCount + outlineEdgeCount) * 2 then
+            SetLength(interiorPts, (interiorCount + outlineEdgeCount) * 2);
           outlineTi := 0;
           while outlineTi < outlineEdgeCount do
           begin
             outlineEk := outlineEdgeArr[outlineTi];
             if (outlineTi + 1 < outlineEdgeCount) and (outlineEdgeArr[outlineTi + 1] = outlineEk) then
             begin
+              // Interior edge — record once in world-XZ, then skip all duplicates of this key
+              interiorVa := word(outlineEk shr 16);
+              interiorVb := word(outlineEk and $FFFF);
+              interiorPts[interiorCount * 2].X := tmppoint[interiorVa][0];
+              interiorPts[interiorCount * 2].Y := tmppoint[interiorVa][2];
+              interiorPts[interiorCount * 2 + 1].X := tmppoint[interiorVb][0];
+              interiorPts[interiorCount * 2 + 1].Y := tmppoint[interiorVb][2];
+              Inc(interiorCount);
               while (outlineTi < outlineEdgeCount) and (outlineEdgeArr[outlineTi] = outlineEk) do
                 inc(outlineTi);
             end
@@ -7803,7 +7833,7 @@ begin
     end;
     // deletedc(hd);
 
-    // Tear down raw-mode GDI+ state (outline mode creates its own TGPGraphics later)
+    // Tear down raw-mode GDI+ state (topographic mode creates its own TGPGraphics later)
     if mapRenderMode = 0 then
     begin
       if gpPenBlue <> nil then gpPenBlue.Free;
@@ -7867,6 +7897,8 @@ begin
       cachedOutlineCount := contoursCount;
       cachedOutlineMinY := contMinY;
       cachedOutlineMaxY := contMaxY;
+      cachedOutlineInterior := Copy(interiorPts, 0, interiorCount * 2);
+      cachedOutlineInteriorCount := interiorCount;
     end;
 
     // Mode 1 render: project world -> screen, DP-simplify, build hole-aware paths, GDI+ render
@@ -7958,26 +7990,54 @@ begin
           gpShadowBrush.Free;
         end;
 
-        // Fill + stroke pass with height-tinted color per outer
+        // Fill pass with height-tinted color per outer
+        for cIdx := 0 to contoursCount - 1 do
+        begin
+          if contourPaths[cIdx] = nil then Continue;
+          if contMaxY > contMinY then
+            heightT := (contoursAvgY[cIdx] - contMinY) / (contMaxY - contMinY)
+          else
+            heightT := 0.5;
+          fillR := Byte(Round(lowR + (Integer(highR) - Integer(lowR)) * heightT));
+          fillG := Byte(Round(lowG + (Integer(highG) - Integer(lowG)) * heightT));
+          fillB := Byte(Round(lowB + (Integer(highB) - Integer(lowB)) * heightT));
+          gpBrush := TGPSolidBrush.Create(MakeColor(235, fillR, fillG, fillB));
+          try
+            gpGraphics.FillPath(gpBrush, contourPaths[cIdx]);
+          finally
+            gpBrush.Free;
+          end;
+        end;
+
+        // Interior triangulation: shared edges between two filtered triangles, drawn
+        // as fine detail inside the fills. Single muted color (matched to stroke palette
+        // but desaturated + transparent), narrower than boundary so the room frame still wins.
+        if interiorCount > 0 then
+        begin
+          topoInteriorPen := TGPPen.Create(
+            MakeColor(95, strokeR, strokeG, strokeB), outlinewidth * 0.75);
+          try
+            for topoIeIdx := 0 to interiorCount - 1 do
+            begin
+              topoIntS1.X := (interiorPts[topoIeIdx * 2].X + mpx) / Zoom + mmx;
+              topoIntS1.Y := (interiorPts[topoIeIdx * 2].Y + mpy) / Zoom + mmy;
+              topoIntS2.X := (interiorPts[topoIeIdx * 2 + 1].X + mpx) / Zoom + mmx;
+              topoIntS2.Y := (interiorPts[topoIeIdx * 2 + 1].Y + mpy) / Zoom + mmy;
+              gpGraphics.DrawLine(topoInteriorPen, topoIntS1.X, topoIntS1.Y, topoIntS2.X, topoIntS2.Y);
+            end;
+          finally
+            topoInteriorPen.Free;
+            topoInteriorPen := nil;
+          end;
+        end;
+
+        // Boundary stroke pass — drawn last so the room frame stays crisp on top of triangulation
         gpPen := TGPPen.Create(MakeColor(255, strokeR, strokeG, strokeB), outlinewidth);
         try
           gpPen.SetLineJoin(LineJoinRound);
           for cIdx := 0 to contoursCount - 1 do
           begin
             if contourPaths[cIdx] = nil then Continue;
-            if contMaxY > contMinY then
-              heightT := (contoursAvgY[cIdx] - contMinY) / (contMaxY - contMinY)
-            else
-              heightT := 0.5;
-            fillR := Byte(Round(lowR + (Integer(highR) - Integer(lowR)) * heightT));
-            fillG := Byte(Round(lowG + (Integer(highG) - Integer(lowG)) * heightT));
-            fillB := Byte(Round(lowB + (Integer(highB) - Integer(lowB)) * heightT));
-            gpBrush := TGPSolidBrush.Create(MakeColor(235, fillR, fillG, fillB));
-            try
-              gpGraphics.FillPath(gpBrush, contourPaths[cIdx]);
-            finally
-              gpBrush.Free;
-            end;
             gpGraphics.DrawPath(gpPen, contourPaths[cIdx]);
           end;
         finally
@@ -12596,21 +12656,21 @@ begin
   showbmpclick(nil);
 end;
 
-procedure TForm1.MapRenderRaw1Click(Sender: TObject);
+procedure TForm1.MapRenderWireframe1Click(Sender: TObject);
 begin
   mapRenderMode := 0;
-  MapRenderRaw1.Checked := True;
-  MapRenderOutline1.Checked := False;
+  MapRenderWireframe1.Checked := True;
+  MapRenderTopographic1.Checked := False;
   BBRelFileName := ''; // force reload
   cachedOutlineFor := ''; cachedOutlineCount := 0;
   DrawMap;
 end;
 
-procedure TForm1.MapRenderOutline1Click(Sender: TObject);
+procedure TForm1.MapRenderTopographic1Click(Sender: TObject);
 begin
   mapRenderMode := 1;
-  MapRenderRaw1.Checked := False;
-  MapRenderOutline1.Checked := True;
+  MapRenderWireframe1.Checked := False;
+  MapRenderTopographic1.Checked := True;
   BBRelFileName := ''; // force reload
   cachedOutlineFor := ''; cachedOutlineCount := 0;
   DrawMap;

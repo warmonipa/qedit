@@ -791,16 +791,16 @@ object Form1: TForm1
       end
       object MapRenderMode1: TMenuItem
         Caption = 'Map render mode'
-        object MapRenderRaw1: TMenuItem
-          Caption = 'Raw (all triangles)'
+        object MapRenderWireframe1: TMenuItem
+          Caption = 'Wireframe'
           Checked = True
           RadioItem = True
-          OnClick = MapRenderRaw1Click
+          OnClick = MapRenderWireframe1Click
         end
-        object MapRenderOutline1: TMenuItem
-          Caption = 'Outline (floor only)'
+        object MapRenderTopographic1: TMenuItem
+          Caption = 'Topographic'
           RadioItem = True
-          OnClick = MapRenderOutline1Click
+          OnClick = MapRenderTopographic1Click
         end
       end
       object N12: TMenuItem
